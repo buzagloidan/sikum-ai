@@ -23,7 +23,7 @@ Sikum.AI is a Telegram bot that automatically generates quizzes from uploaded do
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/sikum-ai.git
+git clone https://github.com/buzagloidan/sikum-ai.git
 cd sikum-ai
 ```
 
