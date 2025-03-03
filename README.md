@@ -2,6 +2,22 @@
 
 Sikum.AI is a Telegram bot that automatically generates quizzes from uploaded documents, helping students learn and test their knowledge.
 
+## Try It Now!
+
+You can try the live version of the bot at:
+**[sikum.buzagloidan.com](https://sikum.buzagloidan.com)**
+
+## Screenshots
+
+### Quiz Generation
+![Quiz Generation](screenshots/quiz-generation.png)
+
+### Quiz Questions
+![Quiz Questions](screenshots/quiz-questions.png)
+
+### Quiz Results
+![Quiz Results](screenshots/quiz-results.png)
+
 ## Features
 
 - 📚 **Document Processing**: Supports PDF, DOCX, PPTX, and TXT files
