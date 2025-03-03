@@ -1,0 +1,10 @@
+python-telegram-bot[webhooks]==20.7
+google-generativeai
+PyPDF2
+python-docx
+python-pptx
+python-dotenv
+APScheduler
+tenacity
+pymysql
+aiosqlite
