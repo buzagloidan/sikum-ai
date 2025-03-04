@@ -18,14 +18,8 @@ from telegram import (
     LabeledPrice
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    PreCheckoutQueryHandler,
-    ConversationHandler
+    Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters, PreCheckoutQueryHandler, ConversationHandler
 )
 import google.generativeai as genai
 import PyPDF2
