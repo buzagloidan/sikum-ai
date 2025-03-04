@@ -6,6 +6,7 @@ import threading
 import logging
 import json
 import time
+import os
 from functools import wraps
 from contextlib import contextmanager, asynccontextmanager
 from typing import Optional, Dict, List, Any, Callable, TypeVar, Awaitable
@@ -13,8 +14,8 @@ from typing import Optional, Dict, List, Any, Callable, TypeVar, Awaitable
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Database configuration
-DB_PATH = 'sikum.db'
+# Database configuration - use the same DB_PATH as sikum.py
+DB_PATH = os.getenv('DB_PATH', 'bot_stats.db')
 MAX_CONNECTIONS = 20  # Limit max connections to avoid resource exhaustion
 CACHE_SIZE = 100  # Maximum number of entries in cache
 CACHE_TTL = 300   # Maximum time in cache (seconds)
@@ -258,6 +259,20 @@ async def init_db():
                     status TEXT DEFAULT 'pending',
                     FOREIGN KEY (quiz_id) REFERENCES saved_quizzes (quiz_id)
                 );
+                
+                -- Create subscriptions table
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    user_id INTEGER PRIMARY KEY,
+                    subscribed_until DATE
+                );
+                
+                -- Create daily_usage table
+                CREATE TABLE IF NOT EXISTS daily_usage (
+                    user_id INTEGER,
+                    date DATE,
+                    attempts INTEGER DEFAULT 1,
+                    PRIMARY KEY (user_id, date)
+                );
             ''')
             
             # Create indexes for faster lookups
@@ -266,6 +281,8 @@ async def init_db():
                 CREATE INDEX IF NOT EXISTS idx_share_token ON saved_quizzes (share_token);
                 CREATE INDEX IF NOT EXISTS idx_user_activity ON user_activity (user_id, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_quiz_reports ON quiz_reports (quiz_id, status);
+                CREATE INDEX IF NOT EXISTS idx_subscriptions_expiry ON subscriptions (subscribed_until);
+                CREATE INDEX IF NOT EXISTS idx_daily_usage_date ON daily_usage (date);
             ''')
             
             logger.info("Database initialized with optimized settings")

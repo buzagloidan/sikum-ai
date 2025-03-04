@@ -9,14 +9,8 @@ You can try the live version of the bot at:
 
 ## Screenshots
 
-### Quiz Generation
-![Quiz Generation](screenshots/quiz-generation.png)
-
-### Quiz Questions
-![Quiz Questions](screenshots/quiz-questions.png)
-
-### Quiz Results
-![Quiz Results](screenshots/quiz-results.png)
+For screenshots of the bot in action, please visit:
+**[sikum.buzagloidan.com](https://sikum.buzagloidan.com)**
 
 ## Features
 
