@@ -473,7 +473,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show bot statistics to admins."""
     user_id = update.effective_user.id
-
+    
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("⛔️ פקודה זו זמינה רק למנהלי הבוט.")
         return
@@ -566,6 +566,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["correct_answers"] = 0
             context.user_data[STATE_QUIZ_ACTIVE] = True
 
+            # Track this successful document processing as a quiz generation
+            await record_document_processed(user_id)
+
             # Cleanup
             await status_message.delete()
             await send_question(update, context)
@@ -580,6 +583,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         await handle_error(update, context, "שגיאה לא צפויה")
         logger.error(f"Unexpected error: {e}", exc_info=True)
+
+async def record_document_processed(user_id: int) -> None:
+    """Record when a document is successfully processed into a quiz."""
+    try:
+        with db_get_connection() as conn:
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO user_activity 
+                (user_id, action_type, action_data, timestamp) 
+                VALUES (?, 'document_processed', ?, ?)
+            ''', (user_id, json.dumps({
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }), datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            conn.commit()
+            logger.info(f"Recorded document processed for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error recording document processed: {e}")
+        # Don't raise an exception, we don't want to interrupt the quiz flow
 
 # Add these optimization functions
 
@@ -1375,96 +1396,259 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def update_user_stats(user_id: int, quiz_completed: bool = False, score: int = 0, total_questions: int = 0) -> None:
     """Update user activity statistics in the database."""
     today_date = date.today().strftime("%Y-%m-%d")
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Log the function call for debugging
+    if quiz_completed:
+        logger.info(f"Recording quiz completion for user {user_id} with score {score}/{total_questions}")
     
     with db_get_connection() as conn:
         c = conn.cursor()
         
-        # First check if we have an entry for today
-        c.execute("SELECT 1 FROM user_activity WHERE user_id = ? AND DATE(timestamp) = DATE(?)", 
-                  (user_id, today_date))
+        # If a quiz was completed, add a dedicated record for it
+        if quiz_completed:
+            try:
+                # Insert a separate record for each quiz completion
+                c.execute('''
+                    INSERT INTO user_activity 
+                    (user_id, action_type, action_data, timestamp) 
+                    VALUES (?, 'quiz_completed', ?, ?)
+                ''', (user_id, json.dumps({
+                    'score': score,
+                    'total_questions': total_questions,
+                    'percentage': (score / total_questions * 100) if total_questions > 0 else 0,
+                    'timestamp': current_time
+                }), current_time))
+                logger.info(f"Successfully inserted quiz_completed record for user {user_id}")
+            except Exception as e:
+                logger.error(f"Error inserting quiz completion record: {e}")
         
-        if not c.fetchone():
-            # Insert new record for today
-            c.execute('''
-                INSERT INTO user_activity 
-                (user_id, action_type, action_data, timestamp) 
-                VALUES (?, 'daily_stats', ?, ?)
-            ''', (user_id, json.dumps({
-                'quizzes_completed': 1 if quiz_completed else 0,
-                'questions_answered': total_questions if quiz_completed else 0,
-                'correct_answers': score if quiz_completed else 0,
-                'daily_uses': 1
-            }), today_date))
-        else:
-            # Update existing record
-            c.execute('''
-                UPDATE user_activity 
-                SET action_data = ?, timestamp = ?
-                WHERE user_id = ? AND action_type = 'daily_stats'
-            ''', (json.dumps({
-                'quizzes_completed': user_stats["total_quizzes"] if quiz_completed else user_stats["total_quizzes"],
-                'questions_answered': user_stats["user_quiz_counts"][user_id] if quiz_completed else user_stats["user_quiz_counts"][user_id],
-                'correct_answers': user_stats["correct_answers"] if quiz_completed else user_stats["correct_answers"],
-                'daily_uses': user_stats["daily_users"][user_id] if quiz_completed else user_stats["daily_users"][user_id]
-            }), datetime.now().strftime('%Y-%m-%d %H:%M:%S'), user_id))
+        # Always update daily stats record
+        try:
+            # First check if we have an entry for today
+            c.execute("""
+                SELECT action_data 
+                FROM user_activity 
+                WHERE user_id = ? AND action_type = 'daily_stats' AND DATE(timestamp) = DATE(?)
+            """, (user_id, today_date))
+            
+            result = c.fetchone()
+            if not result:
+                # Insert new record for today
+                c.execute('''
+                    INSERT INTO user_activity 
+                    (user_id, action_type, action_data, timestamp) 
+                    VALUES (?, 'daily_stats', ?, ?)
+                ''', (user_id, json.dumps({
+                    'quizzes_completed': 1 if quiz_completed else 0,
+                    'questions_answered': total_questions if quiz_completed else 0,
+                    'correct_answers': score if quiz_completed else 0,
+                    'daily_uses': 1
+                }), current_time))
+                logger.info(f"Created new daily_stats record for user {user_id}")
+            else:
+                # Parse existing data and update
+                try:
+                    current_data = json.loads(result[0])
+                    
+                    # Increment completed quizzes if this is a quiz completion
+                    if quiz_completed:
+                        current_data['quizzes_completed'] = current_data.get('quizzes_completed', 0) + 1
+                        current_data['questions_answered'] = current_data.get('questions_answered', 0) + total_questions
+                        current_data['correct_answers'] = current_data.get('correct_answers', 0) + score
+                    
+                    # Always ensure daily_uses exists
+                    if 'daily_uses' not in current_data:
+                        current_data['daily_uses'] = 1
+                    
+                    # Update the record with the incremented values
+                    c.execute('''
+                        UPDATE user_activity 
+                        SET action_data = ?, timestamp = ?
+                        WHERE user_id = ? AND action_type = 'daily_stats' AND DATE(timestamp) = DATE(?)
+                    ''', (json.dumps(current_data), 
+                          current_time, 
+                          user_id, 
+                          today_date))
+                    
+                    if quiz_completed:
+                        logger.info(f"Updated daily_stats for user {user_id}, quizzes_completed now: {current_data['quizzes_completed']}")
+                    
+                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                    logger.error(f"Error updating user stats JSON: {e}")
+                    # If there's an error with the JSON, create a new record
+                    c.execute('''
+                        UPDATE user_activity 
+                        SET action_data = ?, timestamp = ?
+                        WHERE user_id = ? AND action_type = 'daily_stats' AND DATE(timestamp) = DATE(?)
+                    ''', (json.dumps({
+                        'quizzes_completed': 1 if quiz_completed else 0,
+                        'questions_answered': total_questions if quiz_completed else 0,
+                        'correct_answers': score if quiz_completed else 0,
+                        'daily_uses': 1
+                    }), current_time, user_id, today_date))
+        except Exception as e:
+            logger.error(f"Error updating daily stats: {e}")
         
-        conn.commit()
+        # Commit the changes
+        try:
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Error committing user stats changes: {e}")
+            # Try to handle connection errors gracefully
+            try:
+                conn.rollback()
+            except:
+                pass
 
 async def get_stats_message() -> str:
     """Get a formatted string with system statistics."""
     try:
+        total_users = 0
+        active_today = 0
+        total_saved_quizzes = 0
+        total_generated = 0
+        total_quizzes_completed = 0
+        premium_users = 0
+        debug_info = []
+        
         with db_get_connection() as conn:
             c = conn.cursor()
             
             # Get total users who have interacted with the bot in any way
-            c.execute("SELECT COUNT(DISTINCT user_id) FROM user_activity")
-            total_users = c.fetchone()[0]
+            try:
+                c.execute("SELECT COUNT(DISTINCT user_id) FROM user_activity")
+                result = c.fetchone()
+                total_users = result[0] if result else 0
+            except Exception as e:
+                logger.error(f"Error counting users: {e}")
+                debug_info.append(f"Error counting users: {e}")
             
             # Get active users today who have interacted with the bot in any way
-            today = date.today().strftime("%Y-%m-%d")
-            c.execute("""
-                SELECT COUNT(DISTINCT user_id) 
-                FROM user_activity 
-                WHERE DATE(timestamp) = DATE(?)
-            """, (today,))
-            active_today = c.fetchone()[0]
+            try:
+                today = date.today().strftime("%Y-%m-%d")
+                c.execute("""
+                    SELECT COUNT(DISTINCT user_id) 
+                    FROM user_activity 
+                    WHERE DATE(timestamp) = DATE(?)
+                """, (today,))
+                result = c.fetchone()
+                active_today = result[0] if result else 0
+            except Exception as e:
+                logger.error(f"Error counting active users: {e}")
+                debug_info.append(f"Error counting active users: {e}")
             
             # Get total saved quizzes
-            c.execute("SELECT COUNT(*) FROM saved_quizzes")
-            total_saved_quizzes = c.fetchone()[0]
+            try:
+                c.execute("SELECT COUNT(*) FROM saved_quizzes")
+                result = c.fetchone()
+                total_saved_quizzes = result[0] if result else 0
+            except Exception as e:
+                logger.error(f"Error counting saved quizzes: {e}")
+                debug_info.append(f"Error counting saved quizzes: {e}")
             
-            # Get total completed quizzes by counting quiz completions from user_activity
-            c.execute("""
-                SELECT SUM(json_extract(action_data, '$.quizzes_completed')) 
-                FROM user_activity 
-                WHERE action_type = 'daily_stats'
-            """)
-            result = c.fetchone()[0]
-            total_quizzes_completed = int(result) if result is not None else 0
+            # Count total generated quizzes based on daily_usage table
+            try:
+                # Count document uploads from daily_usage attempts
+                c.execute("SELECT SUM(attempts) FROM daily_usage")
+                result = c.fetchone()
+                total_generated = result[0] if result and result[0] is not None else 0
+                debug_info.append(f"Total generated from daily_usage: {total_generated}")
+            except Exception as e:
+                logger.error(f"Error counting generated quizzes from daily_usage: {e}")
+                debug_info.append(f"Error counting from daily_usage: {e}")
+                # Fallback to counting from user_activity if daily_usage table doesn't exist
+                try:
+                    c.execute("""
+                        SELECT COUNT(*) 
+                        FROM user_activity
+                        WHERE action_type = 'document_processed'
+                    """)
+                    result = c.fetchone()
+                    total_generated = result[0] if result else 0
+                    debug_info.append(f"Total generated from document_processed: {total_generated}")
+                except Exception as e2:
+                    logger.error(f"Error counting generated quizzes from user_activity: {e2}")
+                    debug_info.append(f"Error counting from document_processed: {e2}")
+                    # If everything fails, use the saved quizzes count as a minimum estimate
+                    total_generated = total_saved_quizzes
             
-            # Add saved quizzes to get a more accurate total
-            total_quizzes = total_saved_quizzes + total_quizzes_completed
+            # Get total completed quizzes - first and most accurate method is direct count
+            try:
+                c.execute("""
+                    SELECT COUNT(*) 
+                    FROM user_activity 
+                    WHERE action_type = 'quiz_completed'
+                """)
+                result = c.fetchone()
+                total_quizzes_completed = result[0] if result else 0
+                debug_info.append(f"Total quiz_completed records: {total_quizzes_completed}")
+                
+                # If no direct quiz completion records, try aggregating from daily_stats
+                if total_quizzes_completed == 0:
+                    c.execute("""
+                        SELECT SUM(json_extract(action_data, '$.quizzes_completed')) 
+                        FROM user_activity 
+                        WHERE action_type = 'daily_stats'
+                    """)
+                    result = c.fetchone()
+                    if result and result[0] is not None:
+                        total_quizzes_completed = int(result[0])
+                        debug_info.append(f"Total quizzes_completed from daily_stats: {total_quizzes_completed}")
+            except Exception as e:
+                logger.error(f"Error counting completed quizzes: {e}")
+                debug_info.append(f"Error counting completed quizzes: {e}")
+                
+                # If the first method failed, try another approach
+                try:
+                    # Count unique users who have completed quizzes
+                    c.execute("""
+                        SELECT COUNT(DISTINCT user_id)
+                        FROM user_activity
+                        WHERE json_extract(action_data, '$.quizzes_completed') > 0
+                        AND action_type = 'daily_stats'
+                    """)
+                    result = c.fetchone()
+                    if result and result[0]:
+                        # At least one quiz per user who has completed any
+                        total_quizzes_completed = result[0]
+                        debug_info.append(f"Fallback count of users with completions: {total_quizzes_completed}")
+                except Exception as e2:
+                    logger.error(f"Failed fallback for completed quizzes: {e2}")
+                    debug_info.append(f"Failed fallback for completed quizzes: {e2}")
+                    total_quizzes_completed = 0
             
-            # Use RTL mark character for better compatibility
-            rtl = "\u200F"  # Right-to-Left Mark
-            
-            # Format statistics message with RTL marks before each line
-            # This should preserve proper directionality without reversing everything
-            message = (
-                f"{rtl}📊 *סטטיסטיקות המערכת:*\n\n"
-                f"{rtl}👥 משתמשים רשומים: *{total_users}*\n"
-                f"{rtl}👤 משתמשים פעילים היום: *{active_today}*\n"
-                f"{rtl}📚 מבחנים שנוצרו: *{total_quizzes}*\n"
-                f"{rtl}💾 מבחנים שנשמרו: *{total_saved_quizzes}*"
-            )
-            
-            # Ensure the whole message ends with RTL marks
-            message += f"\n{rtl}{rtl}"
-            
-            return message
+            # Get premium users count - handled carefully since table might not exist
+            try:
+                c.execute("""
+                    SELECT COUNT(*) FROM subscriptions 
+                    WHERE subscribed_until >= date('now')
+                """)
+                result = c.fetchone()
+                premium_users = result[0] if result else 0
+            except Exception as e:
+                logger.error(f"Error counting premium users (likely missing table): {e}")
+                debug_info.append(f"Error counting premium users: {e}")
+                premium_users = 0
+        
+        # Format statistics message with RTL marks for proper display in Hebrew
+        rtl_mark = "\u200F"  # Right-to-left mark
+        stats_message = (
+            f"📊 {rtl_mark}סטטיסטיקות המערכת:{rtl_mark}\n\n"
+            f"👤 {rtl_mark}סה\"כ משתמשים: {total_users}{rtl_mark}\n"
+            f"📱 {rtl_mark}משתמשים פעילים היום: {active_today}{rtl_mark}\n"
+            f"📝 {rtl_mark}מבחנים שנוצרו: {total_generated}{rtl_mark}\n"
+            f"💾 {rtl_mark}מבחנים שנשמרו: {total_saved_quizzes}{rtl_mark}\n"
+            f"⭐ {rtl_mark}משתמשי פרימיום: {premium_users}{rtl_mark}"
+        )
+        
+        # For admins, log the debug info
+        logger.info(f"Stats debug info: {'; '.join(debug_info)}")
+        
+        return stats_message
     except Exception as e:
-        logger.error(f"Error in get_stats_message: {str(e)}")
-        return "❌ שגיאה בטעינת הסטטיסטיקות"
+        logger.error(f"Error getting stats: {e}")
+        return "❌ שגיאה בהצגת הסטטיסטיקות"
 
 def init_db():
     """Initialize the SQLite database with our tables."""
@@ -1503,6 +1687,20 @@ def init_db():
                 status TEXT DEFAULT 'pending',
                 FOREIGN KEY (quiz_id) REFERENCES saved_quizzes (quiz_id)
             );
+            
+            -- Subscription tracking
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER PRIMARY KEY,
+                subscribed_until DATE
+            );
+            
+            -- Daily usage tracking
+            CREATE TABLE IF NOT EXISTS daily_usage (
+                user_id INTEGER,
+                date DATE,
+                attempts INTEGER DEFAULT 1,
+                PRIMARY KEY (user_id, date)
+            );
         ''')
         
         # Create indexes for better performance
@@ -1511,6 +1709,8 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_share_token ON saved_quizzes (share_token);
             CREATE INDEX IF NOT EXISTS idx_user_activity ON user_activity (user_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_quiz_reports ON quiz_reports (quiz_id, status);
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_expiry ON subscriptions (subscribed_until);
+            CREATE INDEX IF NOT EXISTS idx_daily_usage_date ON daily_usage (date);
         ''')
         
         conn.commit()
@@ -2487,3 +2687,145 @@ class QuizCache:
 
 # Initialize cache
 quiz_cache = QuizCache()
+
+async def debug_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Debug command to get raw DB stats for admins."""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔️ פקודה זו זמינה רק למנהלי הבוט.")
+        return
+    
+    debug_info = []
+    
+    with db_get_connection() as conn:
+        c = conn.cursor()
+        
+        # Check for quiz_completed records
+        try:
+            c.execute("""
+                SELECT COUNT(*) 
+                FROM user_activity 
+                WHERE action_type = 'quiz_completed'
+            """)
+            result = c.fetchone()
+            quiz_completed_count = result[0] if result else 0
+            debug_info.append(f"quiz_completed records: {quiz_completed_count}")
+            
+            # Show most recent 5 quiz completions
+            c.execute("""
+                SELECT user_id, timestamp, action_data
+                FROM user_activity 
+                WHERE action_type = 'quiz_completed'
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """)
+            results = c.fetchall()
+            if results:
+                debug_info.append("\nRecent quiz completions:")
+                for result in results:
+                    user_id, timestamp, action_data = result
+                    debug_info.append(f"User {user_id} at {timestamp}: {action_data}")
+        except Exception as e:
+            debug_info.append(f"Error counting quiz_completed records: {e}")
+        
+        # Check daily_stats records with quizzes_completed
+        try:
+            c.execute("""
+                SELECT COUNT(*) 
+                FROM user_activity 
+                WHERE action_type = 'daily_stats' 
+                AND json_extract(action_data, '$.quizzes_completed') > 0
+            """)
+            result = c.fetchone()
+            daily_stats_with_completed = result[0] if result else 0
+            debug_info.append(f"\ndaily_stats records with quizzes_completed > 0: {daily_stats_with_completed}")
+            
+            # Sum of quizzes_completed from daily_stats
+            c.execute("""
+                SELECT SUM(json_extract(action_data, '$.quizzes_completed')) 
+                FROM user_activity 
+                WHERE action_type = 'daily_stats'
+            """)
+            result = c.fetchone()
+            quizzes_completed_sum = int(result[0]) if result and result[0] is not None else 0
+            debug_info.append(f"Sum of quizzes_completed from daily_stats: {quizzes_completed_sum}")
+            
+            # Show most recent 5 daily_stats with quizzes_completed
+            c.execute("""
+                SELECT user_id, timestamp, action_data
+                FROM user_activity 
+                WHERE action_type = 'daily_stats'
+                AND json_extract(action_data, '$.quizzes_completed') > 0
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """)
+            results = c.fetchall()
+            if results:
+                debug_info.append("\nRecent daily_stats with completions:")
+                for result in results:
+                    user_id, timestamp, action_data = result
+                    debug_info.append(f"User {user_id} at {timestamp}: {action_data}")
+        except Exception as e:
+            debug_info.append(f"Error checking daily_stats records: {e}")
+        
+        # Check for any recent user_activity records
+        try:
+            c.execute("""
+                SELECT action_type, COUNT(*) 
+                FROM user_activity 
+                GROUP BY action_type
+            """)
+            results = c.fetchall()
+            debug_info.append("\nAction types in user_activity:")
+            for action_type, count in results:
+                debug_info.append(f"  - {action_type}: {count}")
+        except Exception as e:
+            debug_info.append(f"Error checking action types: {e}")
+        
+        # Check daily_usage table
+        try:
+            c.execute("SELECT COUNT(*) FROM daily_usage")
+            result = c.fetchone()
+            daily_usage_count = result[0] if result else 0
+            debug_info.append(f"\ndaily_usage records: {daily_usage_count}")
+            
+            # Sum of attempts
+            c.execute("SELECT SUM(attempts) FROM daily_usage")
+            result = c.fetchone()
+            attempts_sum = result[0] if result and result[0] is not None else 0
+            debug_info.append(f"Sum of attempts from daily_usage: {attempts_sum}")
+        except Exception as e:
+            debug_info.append(f"Error checking daily_usage: {e}")
+    
+    # Send debug info in chunks if needed
+    debug_text = "\n".join(debug_info)
+    if len(debug_text) > 4000:
+        for i in range(0, len(debug_text), 4000):
+            await update.message.reply_text(debug_text[i:i+4000])
+    else:
+        await update.message.reply_text(debug_text)
+
+# Update main() to register the debug command
+def main() -> None:
+    # ... (existing code)
+    
+    # Define main application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("save", save_quiz))
+    application.add_handler(CommandHandler("list", list_saved_quizzes))
+    application.add_handler(CommandHandler("play", play_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("debug_stats", debug_stats_command))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("support", support_command))
+    application.add_handler(CommandHandler("share", share_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("grant", grant_command))
+    application.add_handler(CommandHandler("time", check_time_sync))
+    
+    # ... (rest of the existing code)
