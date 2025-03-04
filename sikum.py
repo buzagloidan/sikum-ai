@@ -489,6 +489,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Log the attempt
         logger.info(f"Document upload attempt by user {user_id}")
         
+        # Check if a quiz is already active
+        if context.user_data.get(STATE_QUIZ_ACTIVE) or context.user_data.get("quiz_completed"):
+            await update.message.reply_text(
+                "❌ יש לך מבחן פעיל כרגע. אנא סיים את המבחן הנוכחי או בטל אותו עם הפקודה /cancel לפני העלאת קובץ חדש."
+            )
+            return
+        
         # Check and increment usage
         uses_today = await get_user_daily_uses(user_id)
         is_premium = await is_user_premium(user_id)
@@ -1139,16 +1146,41 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 
                 # Include the original question in the feedback
                 question_text = current_question['question']
-                options_text = '\n'.join(current_question['options'])
+                
+                # For the feedback message, retrieve the original question's options
+                # The options in the current_question are already randomized, we want to show them 
+                # in the same order they were displayed to the user
+                
+                # First, ensure we're using the same Hebrew letters as in the original question display
+                hebrew_letters = ['א', 'ב', 'ג', 'ד']
+                
+                # Build the display text with the options in the same order they were presented
+                options_display = []
+                for i, option in enumerate(current_question['options']):
+                    # Remove any existing prefixes like "1. " or "A. "
+                    option_text = option.split('. ', 1)[-1] if '. ' in option else option
+                    # Use the corresponding Hebrew letter
+                    letter = hebrew_letters[i]  
+                    options_display.append(f"\u200F{letter}. {option_text}")
+                
+                # Join the options
+                options_text = '\n'.join(options_display)
                 
                 # Format feedback with question included
                 feedback = f"*שאלה {q_index + 1}*\n\n{question_text}\n\n{options_text}\n\n"
                 
+                # Get the text for the correct and selected answers
+                correct_option_text = current_question['options'][correct_option].split('. ', 1)[-1]
+                selected_option_text = current_question['options'][selected_option].split('. ', 1)[-1]
+                
+                # Also include which letter was the correct answer
+                correct_letter = hebrew_letters[correct_option]
+                selected_letter = hebrew_letters[selected_option]
+                
                 if is_correct:
-                    feedback += f"✅ *תשובה נכונה!*\nהתשובה הנכונה: {correct_answer}"
+                    feedback += f"✅ *תשובה נכונה!*\nבחרת: {selected_letter}. {selected_option_text}"
                 else:
-                    selected_text = current_question['options'][selected_option].split('. ', 1)[-1]
-                    feedback += f"❌ *טעות!*\nבחרת: {selected_text}\nהתשובה הנכונה: {correct_answer}"
+                    feedback += f"❌ *טעות!*\nבחרת: {selected_letter}. {selected_option_text}\nהתשובה הנכונה: {correct_letter}. {correct_option_text}"
                 
                 # Add explanation if available
                 if 'explanation' in current_question and current_question['explanation']:
@@ -1302,6 +1334,9 @@ async def show_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Store original questions for potential redo
         context.user_data["original_questions"] = questions.copy()
         
+        # Clear active quiz flag since the quiz is now completed
+        context.user_data.pop(STATE_QUIZ_ACTIVE, None)
+        
         update_user_stats(user_id, quiz_completed=True, score=int(score), total_questions=total)
         
     except Exception as e:
@@ -1376,7 +1411,7 @@ def update_user_stats(user_id: int, quiz_completed: bool = False, score: int = 0
         conn.commit()
 
 async def get_stats_message() -> str:
-    """Get formatted statistics message."""
+    """Get a formatted string with system statistics."""
     try:
         with db_get_connection() as conn:
             c = conn.cursor()
@@ -1394,9 +1429,21 @@ async def get_stats_message() -> str:
             """, (today,))
             active_today = c.fetchone()[0]
             
-            # Get total quizzes completed
+            # Get total saved quizzes
             c.execute("SELECT COUNT(*) FROM saved_quizzes")
-            total_quizzes = c.fetchone()[0]
+            total_saved_quizzes = c.fetchone()[0]
+            
+            # Get total completed quizzes by counting quiz completions from user_activity
+            c.execute("""
+                SELECT SUM(json_extract(action_data, '$.quizzes_completed')) 
+                FROM user_activity 
+                WHERE action_type = 'daily_stats'
+            """)
+            result = c.fetchone()[0]
+            total_quizzes_completed = int(result) if result is not None else 0
+            
+            # Add saved quizzes to get a more accurate total
+            total_quizzes = total_saved_quizzes + total_quizzes_completed
             
             # Use RTL mark character for better compatibility
             rtl = "\u200F"  # Right-to-Left Mark
@@ -1407,7 +1454,8 @@ async def get_stats_message() -> str:
                 f"{rtl}📊 *סטטיסטיקות המערכת:*\n\n"
                 f"{rtl}👥 משתמשים רשומים: *{total_users}*\n"
                 f"{rtl}👤 משתמשים פעילים היום: *{active_today}*\n"
-                f"{rtl}📚 מבחנים שנוצרו: *{total_quizzes}*"
+                f"{rtl}📚 מבחנים שנוצרו: *{total_quizzes}*\n"
+                f"{rtl}💾 מבחנים שנשמרו: *{total_saved_quizzes}*"
             )
             
             # Ensure the whole message ends with RTL marks
@@ -2006,8 +2054,21 @@ async def cleanup_old_sessions():
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel current operation."""
-    # Clear any waiting states
-    context.user_data.clear()
+    # Clear specific quiz states
+    context.user_data.pop(STATE_QUIZ_ACTIVE, None)
+    context.user_data.pop("quiz_completed", None)
+    context.user_data.pop("randomized_questions", None)
+    context.user_data.pop("original_questions", None)
+    context.user_data.pop("current_question_index", None)
+    context.user_data.pop("correct_answers", None)
+    context.user_data.pop("current_quiz_id", None)
+    
+    # Clear waiting states
+    context.user_data.pop("waiting_for_quiz_title", None)
+    context.user_data.pop("waiting_for_quiz_selection", None)
+    context.user_data.pop("waiting_for_share_id", None)
+    context.user_data.pop("quiz_to_save", None)
+    context.user_data.pop("share_after_save", None)
     
     await update.message.reply_text(
         "✅ הפעולה בוטלה.\n"
